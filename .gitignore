@@ -1,0 +1,15 @@
+# .gitignore
+
+# Ignorar o arquivo de variáveis de ambiente
+.env
+
+# Ignorar o banco de dados SQLite
+*.db
+*.db-journal
+
+# Ignorar diretórios de cache do Python
+__pycache__/
+
+# Ignorar arquivos de ambiente virtual (se você usar)
+venv/
+.venv/
