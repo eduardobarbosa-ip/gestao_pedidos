@@ -10,15 +10,15 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from faker import Faker
 import holidays
-from dotenv import load_dotenv # ALTERAÇÃO: Importado para carregar variáveis de ambiente
+from dotenv import load_dotenv
 
 # ==============================================================================
 # --- CONFIGURAÇÕES GERAIS E CONSTANTES ---
 # ==============================================================================
-# ALTERAÇÃO: Carrega as variáveis de ambiente do arquivo .env
+# Carrega as variáveis de ambiente do arquivo .env
 load_dotenv() 
 
-# ALTERAÇÃO: Busca o caminho do DB e a API Key das variáveis de ambiente
+# Busca o caminho do DB e a API Key das variáveis de ambiente
 DB_FILE = os.getenv('DB_FILE_PATH')
 API_KEY = os.getenv('INTELIPOST_API_KEY')
 
@@ -26,24 +26,19 @@ API_KEY = os.getenv('INTELIPOST_API_KEY')
 if not DB_FILE or not API_KEY:
     raise ValueError("Erro: As variáveis de ambiente DB_FILE_PATH e INTELIPOST_API_KEY devem ser definidas.")
 
-try:
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    SCRIPT_DIR = os.getcwd()
-    
 QUOTE_API_URL = 'https://api.intelipost.com.br/api/v1/quote_by_product'
 ORDER_API_URL = 'https://api.intelipost.com.br/api/v1/shipment_order'
 CEP_LOOKUP_API_URL = 'https://brasilapi.com.br/api/cep/v1/'
 
-# --- AJUSTE: Mapeamento de Centros de Distribuição (CDs) atualizado ---
+# Mapeamento de Centros de Distribuição (CDs)
 WAREHOUSES = {
     "01": "06612280",
     "02": "29164140",
-    "03": "12209050", # Alterado
-    "04": "88706200"  # Alterado
+    "03": "12209050",
+    "04": "88706200"
 }
 
-# --- LISTA DE CEPS AMPLIADA ---
+# Lista de CEPs (mantida como no original)
 CEPS_VALIDOS_BRASIL = [
     # Acre (AC)
     "69900-062", "69908-750", "69909-794", "69918-094", "69911-364", # Rio Branco (Capital)
@@ -189,25 +184,156 @@ tz_brasilia = ZoneInfo("America/Sao_Paulo")
 # --- MÓDULO DE GERENCIAMENTO DO BANCO DE DADOS (SQLite) ---
 # ==============================================================================
 def conectar_db():
-    # Garante que o diretório para o DB exista
     db_dir = os.path.dirname(DB_FILE)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     return conn
 
-# ... (o restante do script permanece o mesmo) ...
+def setup_database():
+    """Cria a tabela de pedidos se ela não existir."""
+    conn = conectar_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pedidos (
+            order_number TEXT PRIMARY KEY,
+            status_processo TEXT NOT NULL,
+            latest_volume_state TEXT,
+            created_iso TEXT,
+            estimated_delivery_date_iso TEXT,
+            delivery_method_id TEXT,
+            full_response_json TEXT,
+            late_delivery_flag INTEGER NOT NULL DEFAULT 0,
+            data_criacao_db TEXT,
+            data_atualizacao_db TEXT,
+            update_date_in_transit TEXT,
+            update_date_to_be_delivered TEXT,
+            update_date_delivered TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print("Banco de dados inicializado com sucesso.")
 
 # ==============================================================================
 # --- FUNÇÃO PRINCIPAL DE CRIAÇÃO DE PEDIDOS ---
 # ==============================================================================
 def criar_novos_pedidos(conn, numero_de_pedidos=250):
     """Realiza a cotação e cria novos pedidos, salvando-os no banco de dados."""
-    # ... (o conteúdo desta função permanece o mesmo) ...
+    print(f"\n--- Iniciando criação de {numero_de_pedidos} novos pedidos ---")
+    
+    # --- FUNÇÕES INTERNAS RESTAURADAS ---
+    def adicionar_dias_uteis(data_inicial, dias_uteis):
+        dias_adicionados = 0
+        data_final = data_inicial
+        while dias_adicionados < dias_uteis:
+            data_final += timedelta(days=1)
+            if data_final.weekday() < 5 and data_final not in feriados_br:
+                dias_adicionados += 1
+        return data_final
 
+    def buscar_endereco_por_cep(cep):
+        try:
+            response = requests.get(f"{CEP_LOOKUP_API_URL}{cep}", timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException:
+            return None
+
+    def realizar_cotacao(origin_zip_code, cep_destino, peso, largura, altura, comprimento):
+        custo_do_produto = round(random.uniform(100.0, 5000.0), 2)
+        payload = {
+            "destination_zip_code": cep_destino.replace('-', ''),
+            "origin_zip_code": origin_zip_code,
+            "products": [{"weight": peso, "cost_of_goods": custo_do_produto, "width": largura, "height": altura, "length": comprimento, "quantity": 1}]
+        }
+        headers = {'Content-Type': 'application/json', 'api-key': API_KEY, 'platform': 'automacao'}
+        try:
+            response = requests.post(QUOTE_API_URL, headers=headers, data=json.dumps(payload), timeout=30)
+            response.raise_for_status()
+            resultado = response.json().get("content", {})
+            opcoes_entrega = resultado.get("delivery_options")
+            if not opcoes_entrega: return None
+            opcao = min(opcoes_entrega, key=lambda opt: opt.get("provider_shipping_cost", float('inf')))
+            return {"cotacao_id": resultado.get("id"), "delivery_method_id": opcao.get("delivery_method_id"), "prazo_dias_uteis": opcao.get("delivery_estimate_business_days"), "custo_frete": opcao.get("provider_shipping_cost"), "custo_produto": custo_do_produto}
+        except Exception as e:
+            print(f"ERRO na cotação: {e}")
+            return None
+
+    # --- LÓGICA PRINCIPAL RESTAURADA ---
+    pedidos_criados_count = 0
+    for i in range(numero_de_pedidos):
+        print(f"\nProcessando criação {i + 1}/{numero_de_pedidos}...")
+        
+        warehouse_code = random.choice(list(WAREHOUSES.keys()))
+        origin_zip_code = WAREHOUSES[warehouse_code]
+        print(f"INFO: Usando CD de origem: Código '{warehouse_code}', CEP '{origin_zip_code}'")
+        
+        cep_destino = random.choice(CEPS_VALIDOS_BRASIL)
+        dados_endereco = buscar_endereco_por_cep(cep_destino)
+        
+        if not dados_endereco: 
+            print(f"Não foi possível obter dados para o CEP de destino {cep_destino}. Pulando.")
+            continue
+
+        if not dados_endereco.get('street'):
+            rua_ficticia = fake.street_name()
+            dados_endereco['street'] = rua_ficticia
+            print(f"INFO: Rua não encontrada para CEP geral. Usando valor fictício: '{rua_ficticia}'")
+        
+        if not dados_endereco.get('neighborhood'):
+            bairro_ficticio = fake.bairro()
+            dados_endereco['neighborhood'] = bairro_ficticio
+            print(f"INFO: Bairro não encontrado para CEP geral. Usando valor fictício: '{bairro_ficticio}'")
+
+        p = {"peso": round(random.uniform(0.1, 50.0), 2), "largura": random.randint(1, 100), "altura": random.randint(1, 100), "comprimento": random.randint(1, 100)}
+        
+        cotacao = realizar_cotacao(origin_zip_code, cep_destino, **p)
+        
+        if not cotacao or not all(cotacao.values()): 
+            print(f"Não foi possível obter cotação para o CEP {cep_destino}. Pulando.")
+            continue
+
+        data_criacao = datetime.now(tz_brasilia)
+        order_number = f"PEDIDO-{int(time.time())}"
+        
+        data_estimada_obj = adicionar_dias_uteis(data_criacao, cotacao["prazo_dias_uteis"])
+        data_estimada_ajustada = data_estimada_obj.replace(hour=23, minute=59, second=59)
+        
+        payload_pedido = {
+            "quote_id": cotacao["cotacao_id"], 
+            "delivery_method_id": cotacao["delivery_method_id"], 
+            "order_number": order_number, 
+            "origin_warehouse_code": warehouse_code,
+            "sales_channel": "Marketplace", 
+            "created": data_criacao.isoformat(timespec='seconds'), 
+            "shipped_date": data_criacao.isoformat(timespec='seconds'),
+            "end_customer": {"first_name": fake.first_name(), "last_name": fake.last_name(), "email": fake.email(), "phone": fake.msisdn(), "cellphone": fake.msisdn(), "is_company": False, "federal_tax_payer_id": fake.cpf().replace('.', '').replace('-', ''), "shipping_country": "Brasil", "shipping_state": dados_endereco.get("state"), "shipping_city": dados_endereco.get("city"), "shipping_address": dados_endereco.get("street"), "shipping_number": str(random.randint(1, 9999)), "shipping_quarter": dados_endereco.get("neighborhood"), "shipping_zip_code": dados_endereco.get("cep").replace('-', '')},
+            "shipment_order_volume_array": [{"shipment_order_volume_number": 1, "volume_type_code": "BOX", "weight": p["peso"], "width": p["largura"], "height": p["altura"], "length": p["comprimento"], "products_quantity": 1, "products_nature": "products", "shipment_order_volume_invoice": {"invoice_series": "1", "invoice_number": str(random.randint(1000, 99999)), "invoice_key": ''.join(random.choices('0123456789', k=44)), "invoice_date": data_criacao.isoformat(timespec='seconds'), "invoice_total_value": str(round(cotacao["custo_produto"] + cotacao["custo_frete"], 2)), "invoice_products_value": str(cotacao["custo_produto"]), "invoice_cfop": "6102"}}],
+            "estimated_delivery_date": data_estimada_ajustada.isoformat(timespec='seconds')
+        }
+        
+        headers = {'Content-Type': 'application/json', 'api-key': API_KEY, 'platform': 'automacao'}
+        try:
+            response = requests.post(ORDER_API_URL, headers=headers, data=json.dumps(payload_pedido), timeout=30)
+            response.raise_for_status()
+            
+            cursor = conn.cursor()
+            agora_str = datetime.now(tz_brasilia).isoformat()
+            cursor.execute("INSERT OR IGNORE INTO pedidos (order_number, status_processo, data_criacao_db, data_atualizacao_db) VALUES (?, ?, ?, ?)", (order_number, 'CRIADO', agora_str, agora_str))
+            conn.commit()
+            print(f"SUCESSO: Pedido '{order_number}' criado na API e salvo no banco de dados.")
+            pedidos_criados_count += 1
+        except Exception as e:
+            print(f"ERRO na criação do pedido '{order_number}': {e}")
+        time.sleep(2)
+        
+    print(f"\n--- Processo de criação finalizado: {pedidos_criados_count} novos pedidos foram criados. ---")
 
 if __name__ == "__main__":
-    print("======================================================================"); print("====== SCRIPT DE CRIAÇÃO DE PEDIDOS (VERSÃO SQLite) ======"); print("======================================================================")
+    print("======================================================================")
+    print("====== SCRIPT DE CRIAÇÃO DE PEDIDOS (VERSÃO SQLite) ======")
+    print("======================================================================")
     db_conn = None
     try:
         setup_database()
